@@ -1,0 +1,18 @@
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*~
+.DS_Store
+
+# LibreOffice / lockfiles
+.~lock.*
+
+# Arduino build outputs
+build/
+*.bin
+*.elf
+*.hex
+*.map
