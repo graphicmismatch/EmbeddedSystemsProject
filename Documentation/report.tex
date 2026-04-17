@@ -1,0 +1,880 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{url}
+
+\title{HealthPet: Virtual Fitness Companion on the Seeed Studio XIAO SAMD21}
+
+% Replace the placeholder author block before submission.
+\author{
+\IEEEauthorblockN{Author Details To Be Added}
+\IEEEauthorblockA{Institution or Course Details}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+HealthPet is a compact embedded virtual fitness companion implemented on the Seeed Studio XIAO SAMD21. The system combines vibration-based activity sensing, an SSD1306 OLED interface, RTC-backed time continuity, EEPROM-backed persistence, button-driven interaction, and lightweight audio feedback in a resource-constrained microcontroller design. Rather than presenting activity as raw metrics alone, the firmware maps user movement to the wellbeing of a persistent virtual pet whose health, affection, rewards, and animations evolve over time. The implementation emphasizes bounded memory use, short interrupt handlers, non-blocking foreground scheduling, personalized activity targets, and robust save-and-restore behavior. This report presents the project motivation, hardware and software architecture, state model, interfacing strategy, debugging and optimization approach, measured memory results, limitations, and future scope in IEEE two-column format.
+\end{abstract}
+
+\begin{IEEEkeywords}
+embedded systems, SAMD21, virtual pet, activity tracking, OLED, I2C, EEPROM, RTC, firmware architecture, optimization
+\end{IEEEkeywords}
+
+\section{Motivation and Background}
+The motivation for this project is grounded in the idea that emotional and interactive systems can encourage more consistent engagement than passive displays. The initial project proposal, contained in \texttt{Review1.pdf}, framed the system as a virtual fitness companion rather than a conventional pedometer or activity dashboard \cite{review1}.
+
+The proposal emphasized several key ideas:
+\begin{itemize}
+\item emotional state can be used as a motivational signal;
+\item personalized activity feedback is more realistic than one fixed goal for all users;
+\item a small low-power microcontroller is sufficient to host an expressive interactive system; and
+\item activity reminders can be made more engaging when they are presented as the needs or mood of a companion rather than as impersonal alerts.
+\end{itemize}
+
+The proposal also connected the system to behavioral ideas:
+\begin{itemize}
+\item emotionally expressive digital agents can influence user behavior \cite{byrne2012};
+\item both positive and negative feedback may be motivational when applied carefully; and
+\item routine care for a companion can help reinforce habit formation \cite{park2025,martins2023}.
+\end{itemize}
+
+The implemented project realizes these ideas in embedded form:
+\begin{itemize}
+\item the pet becomes happier with user activity;
+\item low activity eventually reduces health and affection;
+\item daily targets adapt using recent history instead of a hard-coded universal number; and
+\item the device maintains continuity through saved state and RTC synchronization.
+\end{itemize}
+
+Thus, the project motivation is both technical and human-centered. Technically, it demonstrates a complete embedded interactive product on resource-constrained hardware. Behaviorally, it attempts to make physical activity feel visible, immediate, and personally meaningful.
+
+\section{Problem Statement}
+Many embedded wellness devices display raw metrics such as steps, time, or simple bars. While these metrics are useful, they do not always sustain user attention over long periods. Static targets can also become discouraging when they do not reflect the user's current baseline or lifestyle.
+
+The problem addressed by this project is the following:
+\begin{quote}
+How can a small embedded system motivate ongoing physical activity using simple hardware, while maintaining low resource usage, continuity of state, and emotionally interpretable feedback?
+\end{quote}
+
+To solve this problem, the project must meet several requirements simultaneously:
+\begin{itemize}
+\item sense physical activity through a compact sensor path;
+\item provide feedback that is more engaging than numeric data alone;
+\item maintain state between resets and power cycles;
+\item adapt expectations to the user's recent behavior;
+\item fit within the memory and execution constraints of the SAMD21; and
+\item remain robust enough for long-running use.
+\end{itemize}
+
+\texttt{HealthPet} addresses these requirements by combining embedded firmware architecture with lightweight game-state logic and an emotionally expressive OLED interface.
+
+\section{Project Objectives}
+The implemented system reflects the following objectives.
+
+\subsection{Emotional State System}
+The pet should exhibit different visible states according to user activity and internal condition:
+\begin{itemize}
+\item awake;
+\item sleeping;
+\item happy;
+\item surprised;
+\item weakened or unhealthy;
+\item dead; and
+\item left the user.
+\end{itemize}
+These states convert internal game state into immediately interpretable user feedback.
+
+\subsection{Personalized Activity Feedback}
+The project should avoid relying solely on a fixed universal target. Instead, it should compute a personalized activity target based on recent performance. In the firmware, this is implemented using:
+\begin{itemize}
+\item a rolling activity history;
+\item a minimum baseline; and
+\item a small percentage-based target increase.
+\end{itemize}
+
+\subsection{Sensor-Based Activity Tracking}
+The system should convert physical motion into activity counts and then into pet-state changes. For the implemented version, a vibration sensor is used as the activity signal source.
+
+\subsection{Persistent Interaction}
+The pet should not reset its life entirely every time power is removed. The system therefore stores save data externally and uses an RTC clock to preserve elapsed time.
+
+\subsection{Embedded Efficiency}
+The system should remain practical on a SAMD21 MCU. This requires:
+\begin{itemize}
+\item bounded memory use;
+\item no application-level dynamic allocation;
+\item short interrupt handlers;
+\item non-blocking scheduling; and
+\item compact display assets.
+\end{itemize}
+
+\section{Unique Selling Proposition}
+The most important USP of \texttt{HealthPet} is that it transforms physical activity monitoring into a persistent relationship-driven embedded interaction rather than a simple activity counter.
+
+The project's distinguishing points are:
+\begin{enumerate}
+\item emotion-driven embedded feedback, where user movement changes the perceived wellbeing of a virtual companion;
+\item personalized target generation using recent history instead of a rigid universal threshold;
+\item RTC-backed continuity so the pet can recover elapsed time and continue evolving after reboot;
+\item low-resource implementation on a compact SAMD21 with an OLED, simple sensor input, and external I\textsuperscript{2}C peripherals;
+\item integrated system design across sensing, storage, UI, timing, audio, and optimization; and
+\item visible cause-and-effect interaction in which activity, inactivity, rewards, and neglect all produce direct outcomes.
+\end{enumerate}
+
+In technical terms, the project is not only a game interface, but also a demonstration of how embedded design can encode behavioral feedback loops using constrained hardware.
+
+\section{Overall System Overview}
+At a high level, the system contains one microcontroller board, one OLED display, one RTC clock, one EEPROM storage path, one vibration sensor, three buttons, one buzzer, sprite assets in flash, and a software state machine that links user activity to pet behavior.
+
+The system can be viewed in layers.
+
+\subsection{Physical Layer}
+\begin{itemize}
+\item sensor input;
+\item button input;
+\item OLED output;
+\item buzzer output; and
+\item I\textsuperscript{2}C peripheral communication.
+\end{itemize}
+
+\subsection{Embedded Control Layer}
+\begin{itemize}
+\item interrupt capture;
+\item debouncing;
+\item scheduling;
+\item save and load; and
+\item clock update.
+\end{itemize}
+
+\subsection{Application Logic Layer}
+\begin{itemize}
+\item pet health and affection;
+\item rewards and inventory;
+\item daily target logic; and
+\item emotional state transitions.
+\end{itemize}
+
+\subsection{Presentation Layer}
+\begin{itemize}
+\item animation selection;
+\item text display;
+\item status messages; and
+\item progress bars.
+\end{itemize}
+
+\section{Hardware Description}
+The project is designed for the Seeed Studio XIAO SAMD21.
+
+\subsection{Microcontroller Board}
+\textbf{Board:} Seeed Studio XIAO SAMD21.
+
+\textbf{Processor:} ARM Cortex-M0+.
+
+\textbf{Clock:} 48 MHz.
+
+\textbf{Memory:} 256 KB flash and 32 KB RAM.
+
+This board is suitable because it provides sufficient flash for graphics and firmware logic, enough RAM for the display buffer and runtime state, low power operation, Arduino ecosystem support, I\textsuperscript{2}C support for OLED and RTC, and adequate GPIO for buttons, sensor, and buzzer.
+
+\subsection{OLED Display}
+\textbf{Display type:} 128$\times$64 SSD1306 OLED with a dual-color panel.
+
+\textbf{Interface:} I\textsuperscript{2}C.
+
+\textbf{Address:} \texttt{0x3C}.
+
+\textbf{Role:} display pet sprites, progress bars for health and affection, inventory, stats, save state, and status messages.
+
+Although the SSD1306 controller is still driven as a 1-bit display in software, the physical OLED panel is dual-color. In the actual module used for this project, the upper band is yellow while the remaining display area is blue, making the top status bar visually distinct from the rest of the interface.
+
+\subsection{RTC Clock Module}
+\textbf{Clock type:} DS1307-compatible RTC path assumed by firmware.
+
+\textbf{I\textsuperscript{2}C address:} \texttt{0x68}.
+
+\textbf{Role:} store current wall-clock-like time for the game and allow time progression to persist even when the device is powered off.
+
+\subsection{EEPROM Storage}
+\textbf{Storage path:} TinyRTC EEPROM region at I\textsuperscript{2}C addresses \texttt{0x50} to \texttt{0x57}.
+
+\textbf{Role:} store saved game state including health, affection, inventory, activity history, and in-game time.
+
+\subsection{Vibration Sensor}
+\textbf{Input source:} SW-420 module or switch-style vibration sensor.
+
+\textbf{Pin:} \texttt{D1}.
+
+\textbf{Role:} convert physical movement into digital pulses and feed the activity subsystem.
+
+\subsection{Buttons}
+\textbf{Buttons:} previous, action, and next.
+
+\textbf{Pins:} \texttt{D2}, \texttt{D3}, and \texttt{D6}.
+
+\textbf{Configuration:} \texttt{INPUT\_PULLUP}.
+
+\textbf{Role:} screen navigation, item selection, pet interaction, and inventory usage.
+
+\subsection{Buzzer}
+\textbf{Type:} passive buzzer.
+
+\textbf{Pin:} \texttt{D0}.
+
+\textbf{Role:} button feedback, reward cues, warning sounds, and pet death or leave sounds.
+
+\subsection{Power and Bus Sharing}
+The OLED, RTC, and EEPROM share the I\textsuperscript{2}C bus. The firmware explicitly changes the I\textsuperscript{2}C clock depending on which device is being accessed:
+\begin{itemize}
+\item storage and RTC traffic at a slower clock; and
+\item display traffic at a faster clock.
+\end{itemize}
+This is a practical example of bus-aware embedded design.
+
+\section{Functional Block-Level Explanation}
+\subsection{Sensor Block}
+Captures motion and generates raw pulses. This is the starting point for activity-based game changes.
+
+\subsection{Interrupt Block}
+Converts raw pin changes into debounced transition counters without doing heavy work inside the ISR.
+
+\subsection{Activity Processing Block}
+Converts pulses into activity points, happiness triggers, and reward opportunities.
+
+\subsection{Timekeeping Block}
+Advances in-game time, detects day rollover, and synchronizes game time with RTC time.
+
+\subsection{Persistence Block}
+Serializes and restores the pet state through EEPROM with checksum validation and retry logic.
+
+\subsection{UI Block}
+Chooses the current screen and draws dynamic content.
+
+\subsection{Animation Block}
+Maps pet condition to sprite clips and chooses the current frame.
+
+\subsection{Audio Block}
+Produces short sound sequences that reinforce UI and pet-state events.
+
+\section{Working Principle}
+The working principle of the project is based on converting physical activity into pet wellbeing over time.
+
+\subsection{Core Principle}
+When the user moves, the vibration sensor produces pulses. The firmware interprets those pulses as activity. Activity improves the pet's effective daily progress and can trigger positive animations and rewards. If the user remains insufficiently active, the pet gradually loses health and affection. In extreme cases, the pet can die or leave.
+
+\begin{quote}
+\ttfamily
+User movement -> sensed activity -> progress increase -> positive pet response\\
+Low activity -> unmet pace -> penalties -> negative pet response
+\end{quote}
+
+\subsection{Step-by-Step Working Principle}
+\begin{enumerate}
+\item The vibration sensor changes state.
+\item The pin interrupt fires.
+\item The ISR records the event and debounces it.
+\item The foreground loop copies the pending event counts safely.
+\item The event count is converted into activity gain.
+\item The pet state is updated.
+\item If enough activity is achieved, the pet becomes happy and rewards may be granted.
+\item Time progresses continuously.
+\item If progress remains below expectation, affection and health decrease.
+\item The display updates to reflect the new state.
+\item The save system periodically stores the result.
+\item RTC time ensures continuity across resets.
+\end{enumerate}
+
+\subsection{Personalization Principle}
+The system does not rely only on one fixed target. It computes a target based on:
+\begin{itemize}
+\item a rolling recent activity average;
+\item a minimum floor; and
+\item a small growth factor.
+\end{itemize}
+This creates a target that is challenging but not arbitrary.
+
+\subsection{Emotional Feedback Principle}
+The pet's behavior acts as the interface:
+\begin{itemize}
+\item good activity leads to a healthy or happy pet; and
+\item low activity leads to a weaker, sadder, or eventually absent pet.
+\end{itemize}
+This creates emotional continuity and makes the feedback more immediate than plain numerical reporting.
+
+\section{Interfacing}
+Interfacing in this project refers to both hardware interfacing and software-level peripheral integration.
+
+\subsection{OLED Interfacing}
+\textbf{Interface:} I\textsuperscript{2}C.
+
+\textbf{Connections:} \texttt{D4} to SDA and \texttt{D5} to SCL.
+
+\textbf{Library:} \texttt{Adafruit\_SSD1306} and \texttt{Adafruit\_GFX}.
+
+\textbf{Software behavior:}
+\begin{itemize}
+\item the display is initialized in \texttt{setup()};
+\item the draw buffer is updated in RAM; and
+\item \texttt{display.display()} flushes the buffer to the OLED.
+\end{itemize}
+
+\subsection{RTC and EEPROM Interfacing}
+\textbf{Interface:} I\textsuperscript{2}C.
+
+\textbf{Clock address:} \texttt{0x68}.
+
+\textbf{EEPROM scan range:} \texttt{0x50} through \texttt{0x57}.
+
+\textbf{Software behavior:}
+\begin{itemize}
+\item RTC is probed during startup;
+\item EEPROM is scanned until a valid storage address is found;
+\item game time is synchronized with the RTC; and
+\item save blocks are read and written in chunks.
+\end{itemize}
+
+\subsection{Sensor Interfacing}
+\textbf{Interface:} GPIO digital input with interrupt.
+
+\textbf{Pin:} \texttt{D1}.
+
+\textbf{Mode:} \texttt{INPUT\_PULLUP}.
+
+\textbf{Interrupt mode:} \texttt{CHANGE}.
+
+\textbf{Software behavior:}
+\begin{itemize}
+\item each sensor change triggers \texttt{onSensorInterrupt()};
+\item raw events are debounced; and
+\item foreground code processes counts later.
+\end{itemize}
+
+\subsection{Button Interfacing}
+\textbf{Interface:} GPIO digital input.
+
+\textbf{Pins:} \texttt{D2}, \texttt{D3}, and \texttt{D6}.
+
+\textbf{Mode:} \texttt{INPUT\_PULLUP}.
+
+\textbf{Software behavior:}
+\begin{itemize}
+\item buttons are polled in \texttt{loop()};
+\item debouncing is handled in software; and
+\item press detection is converted into one-shot events.
+\end{itemize}
+
+\subsection{Buzzer Interfacing}
+\textbf{Interface:} GPIO output using \texttt{tone()}.
+
+\textbf{Pin:} \texttt{D0}.
+
+\textbf{Software behavior:}
+\begin{itemize}
+\item sound effects are defined as note-duration sequences; and
+\item playback is advanced without blocking the foreground loop.
+\end{itemize}
+
+\section{Networking and Communication Protocols}
+This project does not use IP networking such as Wi-Fi, BLE, Ethernet, TCP, or MQTT. However, it does use embedded peripheral communication protocols, especially I\textsuperscript{2}C, which is a shared bus protocol at the board level.
+
+\subsection{I\textsuperscript{2}C Protocol}
+I\textsuperscript{2}C is the most important communication protocol in this project.
+
+Devices on the bus are:
+\begin{itemize}
+\item SSD1306 OLED display;
+\item RTC clock; and
+\item external EEPROM on the RTC module.
+\end{itemize}
+
+Important addresses are \texttt{0x3C} for the OLED, \texttt{0x68} for the RTC clock, and \texttt{0x50} to \texttt{0x57} for the EEPROM.
+
+I\textsuperscript{2}C is suitable here because only two signal lines are needed, multiple devices can share the same bus, and it is widely supported by the SAMD21 and Arduino libraries.
+
+In firmware, the protocol is used through calls such as \texttt{Wire.beginTransmission(address)}, \texttt{Wire.write(...)}, \texttt{Wire.endTransmission()}, \texttt{Wire.requestFrom(address, count)}, and \texttt{Wire.read()}.
+
+\subsection{Bus-Speed Management}
+The firmware uses two I\textsuperscript{2}C clock settings:
+\begin{itemize}
+\item a slower clock for storage and RTC access; and
+\item a faster clock for display access.
+\end{itemize}
+This is a practical optimization because displays and RTC or EEPROM devices may have different timing sensitivities.
+
+\subsection{GPIO-Based Digital Signaling}
+The buttons, sensor, and buzzer are not network protocols in the usual sense, but they are hardware signaling interfaces:
+\begin{itemize}
+\item buttons use pull-up digital input;
+\item the sensor uses digital interrupt signaling; and
+\item the buzzer uses timing-based tone output.
+\end{itemize}
+
+\section{Software Architecture}
+The software architecture is organized as a single embedded application with several logical subsystems.
+
+\subsection{Source Files}
+\begin{itemize}
+\item \texttt{HealthPet.ino}: main firmware;
+\item \texttt{GraphicsUtils.h} and \texttt{GraphicsUtils.cpp}: helper routines for rendering;
+\item \texttt{Bitmap.h}: sprite structure definition; and
+\item \texttt{Images.h}: sprite and icon data in flash memory.
+\end{itemize}
+
+\subsection{Main Subsystems}
+\begin{enumerate}
+\item hardware setup;
+\item timekeeping;
+\item persistence;
+\item pet simulation;
+\item activity sensing;
+\item button input;
+\item rendering; and
+\item audio.
+\end{enumerate}
+
+\subsection{Architectural Style}
+The system follows an event-driven, loop-based embedded architecture:
+\begin{itemize}
+\item interrupt for raw sensor capture;
+\item foreground loop for processing;
+\item time-triggered updates; and
+\item state-driven rendering.
+\end{itemize}
+This style is appropriate because the system is small, there is no RTOS, hard scheduling demands are moderate, and the tasks are cooperative and bounded.
+
+\section{Data Structures and State Model}
+The project uses compact C++ structs and enums to hold state efficiently.
+
+\subsection{UI and State Enums}
+\begin{itemize}
+\item \texttt{ScreenMode};
+\item \texttt{InventorySelection};
+\item \texttt{HealthTier}; and
+\item \texttt{SaveReadStatus}.
+\end{itemize}
+These create readable and bounded state values.
+
+\subsection{Button and Sound Structs}
+\begin{itemize}
+\item \texttt{ButtonState};
+\item \texttt{ToneStep}; and
+\item \texttt{SoundEffect}.
+\end{itemize}
+These support human interaction and feedback.
+
+\subsection{Animation Structs}
+\begin{itemize}
+\item \texttt{AnimationClip}; and
+\item \texttt{SpriteTierSet}.
+\end{itemize}
+These connect asset storage to time-based animation playback.
+
+\subsection{Persistence Struct}
+\texttt{SaveData} is the serialized state stored in EEPROM.
+
+\subsection{Main Runtime Struct}
+\texttt{PetState} is the heart of the live simulation and contains health, affection, inventory, activity history, current UI mode, temporary animation deadlines, reward pacing state, dirty flag, and status message. This is a strong architectural choice because all live high-level state is centralized and easy to save or restore.
+
+\section{Programming Logic}
+Programming logic in this project can be understood as the following cycle:
+\begin{quote}
+\ttfamily
+Sense -> Interpret -> Update State -> Render -> Save -> Sleep
+\end{quote}
+
+\subsection{Startup Logic}
+\texttt{setup()} performs:
+\begin{itemize}
+\item serial startup;
+\item pin configuration;
+\item random seed initialization;
+\item I\textsuperscript{2}C startup;
+\item interrupt attachment;
+\item display initialization;
+\item RTC and EEPROM probing; and
+\item state load.
+\end{itemize}
+
+\subsection{Loop Logic}
+\texttt{loop()} performs the following tasks:
+\begin{enumerate}
+\item get current time;
+\item update game clock;
+\item debounce buttons;
+\item process sensor data;
+\item handle user actions;
+\item update sound playback;
+\item save if needed;
+\item refresh display if needed; and
+\item sleep until the next interrupt.
+\end{enumerate}
+
+\subsection{Time Progression Logic}
+The game clock is based on accumulated milliseconds rather than display frames. The firmware accumulates elapsed real time, converts it to virtual minutes, and applies hourly and daily state changes. This makes the simulation independent of frame rate.
+
+\subsection{State Progression Logic}
+The project encodes the ideas that activity improves long-term outcomes, inactivity causes penalties, rewards are gated and spaced, and daily performance influences future expectations.
+
+\subsection{UI Logic}
+The UI is screen-based with home, stats, and inventory views. Each screen has a dedicated draw routine and shares a common top status bar.
+
+\section{Detailed Functional Blocks}
+This section lists the major software blocks and their purpose.
+
+\subsection{Interrupt and Concurrency Block}
+\textbf{Key routines:} \texttt{onSensorInterrupt()}, \texttt{saveAndDisableInterrupts()}, \texttt{restoreInterrupts()}, and \texttt{updateSensor()}.
+
+\textbf{Purpose:} capture raw physical activity safely and isolate ISR work from high-level game logic.
+
+\subsection{Activity Computation Block}
+\textbf{Key routines:} \texttt{onActivityPulse()}, \texttt{rollingAverage()}, \texttt{activityTarget()}, and \texttt{todayProgressPercent()}.
+
+\textbf{Purpose:} convert raw pulses into meaningful progress and personalize the target.
+
+\subsection{Persistence Block}
+\textbf{Key routines:} \texttt{encodeSaveData()}, \texttt{decodeSaveDataDetailed()}, \texttt{readSaveDataWithRetry()}, \texttt{writeSaveDataWithRetry()}, \texttt{saveState()}, and \texttt{loadState()}.
+
+\textbf{Purpose:} preserve state across resets and validate data integrity.
+
+\subsection{RTC Block}
+\textbf{Key routines:} \texttt{readRtcClockMinutes()}, \texttt{writeRtcClockMinutes()}, \texttt{rtcMinutesFromDateTime()}, \texttt{rtcDateTimeFromMinutes()}, and \texttt{syncRtcClockToGameTime()}.
+
+\textbf{Purpose:} maintain persistent time and support offline progress recovery.
+
+\subsection{Simulation Block}
+\textbf{Key routines:} \texttt{completeDay()}, \texttt{applyActivityPaceDrain()}, \texttt{advanceGameMinute()}, \texttt{advanceGameMinutes()}, and \texttt{updateClock()}.
+
+\textbf{Purpose:} evolve pet state over time and create consequences for inactivity.
+
+\subsection{Input Block}
+\textbf{Key routines:} \texttt{updateButton()}, \texttt{handleInput()}, \texttt{cycleScreen()}, \texttt{petThePet()}, and \texttt{useInventoryItem()}.
+
+\textbf{Purpose:} map physical buttons to meaningful interaction.
+
+\subsection{Reward and Inventory Block}
+\textbf{Key routines:} \texttt{addReward()} and \texttt{maybeDropReward()}.
+
+\textbf{Purpose:} provide positive reinforcement and make activity feel rewarding.
+
+\subsection{Presentation Block}
+\textbf{Key routines:} \texttt{activeClip()}, \texttt{currentFrame()}, \texttt{drawTopBar()}, \texttt{drawStatusLine()}, \texttt{drawHomeScreen()}, \texttt{drawStatsScreen()}, \texttt{drawInventoryScreen()}, and \texttt{drawUi()}.
+
+\textbf{Purpose:} translate internal state into human-visible output.
+
+\subsection{Audio Block}
+\textbf{Key routines:} \texttt{playSound()} and \texttt{updateSound()}.
+
+\textbf{Purpose:} reinforce interaction and state changes acoustically.
+
+\section{Memory Organization and Run-Time Environment}
+The target MCU has 256 KB flash and 32 KB RAM. The final default \texttt{-Os} build uses \texttt{.text = 57868} bytes, \texttt{.data = 668} bytes, and \texttt{.bss = 3280} bytes. Static RAM usage at startup is therefore:
+\[
+668 + 3280 = 3948 \text{ bytes}
+\]
+
+\subsection{Static Allocation Strategy}
+The firmware uses static allocation rather than application-level dynamic allocation. No application-level uses of \texttt{new}, \texttt{delete}, \texttt{malloc}, \texttt{calloc}, \texttt{realloc}, or \texttt{free} were found in the project firmware source. This is appropriate because RAM is limited, fragmentation should be avoided, and static memory is easier to verify.
+
+\subsection{Memory Placement Strategy}
+\begin{itemize}
+\item code and constants are stored in flash;
+\item sprite data is stored in flash using \texttt{PROGMEM};
+\item initialized globals are stored in \texttt{.data};
+\item zero-initialized globals are stored in \texttt{.bss}; and
+\item local temporaries are stored on the stack.
+\end{itemize}
+
+\subsection{Important Global RAM Objects}
+From the real object file:
+\begin{itemize}
+\item \texttt{display} occupies 108 bytes;
+\item \texttt{pet} occupies 88 bytes; and
+\item button state objects occupy 8 bytes each in initialized data.
+\end{itemize}
+These are modest sizes and confirm that the design is memory-conscious.
+
+\section{Debugging Strategy and Debugging Process}
+Debugging in embedded systems must be deliberate because errors may arise from timing, interrupts, bus communication, state corruption, power-cycle recovery, and memory misuse.
+
+\subsection{Debugging Methods Used or Supported}
+\begin{enumerate}
+\item serial debug output for startup prints, RTC and EEPROM detection status, and invalid save conditions;
+\item display-level observation through status messages and save markers;
+\item state verification through readback comparison after saves;
+\item structured logic isolation between interrupts and foreground logic; and
+\item static disassembly and map-file inspection to validate optimization and memory layout.
+\end{enumerate}
+
+\subsection{Typical Debugging Scenarios}
+\textbf{Sensor not producing activity:} verify interrupt attachment, pin wiring and pull-up, debounce timing, \texttt{pendingSensorActiveEdges}, and whether \texttt{petUnavailable()} is preventing updates.
+
+\textbf{RTC or save not working:} verify I\textsuperscript{2}C wiring, RTC address \texttt{0x68}, EEPROM response in \texttt{0x50} to \texttt{0x57}, observe serial messages, and check the checksum validation path.
+
+\textbf{UI not refreshing properly:} verify display initialization, \texttt{drawUi()} scheduling, and I\textsuperscript{2}C speed switching.
+
+\textbf{State unexpectedly resetting:} verify save write success, save readback comparison, and inspect save version, magic, and checksum.
+
+\subsection{Why This Debugging Approach Fits}
+The project uses lightweight but effective debugging techniques suitable for a small embedded target without a complex debug UI.
+
+\section{Optimization Strategy}
+Optimization in this project is both source-level and compiler-level.
+
+\subsection{Source-Level Optimization Strategies}
+\textbf{Short ISR design:} \texttt{onSensorInterrupt()} does minimal work, including debounce timing, pin sampling, and counter increment. This minimizes interrupt overhead.
+
+\textbf{Deferred processing:} activity interpretation happens in \texttt{updateSensor()} and \texttt{onActivityPulse()}, not in the ISR.
+
+\textbf{Dirty-flag save policy:} state is saved only when necessary.
+
+\textbf{Display refresh throttling:} display updates occur at a controlled interval rather than every loop iteration.
+
+\textbf{Flash placement of assets:} sprites and many constants stay in flash.
+
+\textbf{Fixed-size data structures:} this improves predictability and memory efficiency.
+
+\subsection{Compiler-Level Optimization Strategies}
+Measured builds include \texttt{-O0}, \texttt{-O2}, and \texttt{-Os}. The measured \texttt{.text} size results are summarized in Table~\ref{tab:build-size}.
+
+\begin{table}[!t]
+\caption{Measured Code Size by Build Option}
+\label{tab:build-size}
+\centering
+\begin{tabular}{|c|r|}
+\hline
+\textbf{Build} & \textbf{\texttt{.text} Size (bytes)} \\
+\hline
+\texttt{-O0} & 87324 \\
+\hline
+\texttt{-O2} & 62068 \\
+\hline
+\texttt{-Os} & 57868 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Per-Function Optimization Effects}
+Table~\ref{tab:function-size} shows the measured size changes for selected routines.
+
+\begin{table}[!t]
+\caption{Per-Function Optimization Effects}
+\label{tab:function-size}
+\centering
+\scriptsize
+\begin{tabular}{|l|r|r|r|}
+\hline
+\textbf{Function} & \textbf{\texttt{-O0}} & \textbf{\texttt{-O2}} & \textbf{\texttt{-Os}} \\
+\hline
+\texttt{onSensorInterrupt()} & 0xc8 & 0x70 & 0x64 \\
+\hline
+\texttt{updateSensor()} & 0x68 & 0x34 & 0x38 \\
+\hline
+\texttt{onActivityPulse()} & 0x11c & 0xe4 & 0xd4 \\
+\hline
+\texttt{rollingAverage()} & 0x60 & 0x2c & 0x2c \\
+\hline
+\end{tabular}
+\normalsize
+\end{table}
+
+\subsection{Optimization Mechanisms Observed}
+Observed effects include better register allocation, inlining of small helpers, elimination of stack temporaries, shorter branches and early exits, and size-aware code generation under \texttt{-Os}.
+
+\subsection{Remaining Costs}
+Some arithmetic still compiles to helper calls such as \texttt{\_\_udivsi3} and \texttt{\_\_aeabi\_uidivmod}. These are visible in \texttt{rollingAverage()}, \texttt{activityTarget()}, \texttt{todayProgressPercent()}, and \texttt{onActivityPulse()}. This is expected for nontrivial integer division on Cortex-M0+.
+
+\section{Final Working Model}
+The final working model is a compact interactive embedded device with the following behavior.
+
+\subsection{User Experience}
+\begin{enumerate}
+\item The device powers on.
+\item The OLED initializes and shows the pet.
+\item Saved state is restored.
+\item RTC time is checked and the game catches up if needed.
+\item The pet reflects current health and affection.
+\item User movement generates activity.
+\item Activity improves the pet's state and can trigger rewards.
+\item Buttons allow navigation and interaction.
+\item Treats and gifts can be used from inventory.
+\item The pet's condition changes across the day depending on user engagement.
+\end{enumerate}
+
+\subsection{Physical Final Model Blocks}
+\begin{itemize}
+\item XIAO SAMD21 controller board;
+\item OLED display;
+\item vibration sensor;
+\item RTC module with EEPROM;
+\item three buttons;
+\item buzzer;
+\item common 3.3 V and ground; and
+\item shared I\textsuperscript{2}C bus.
+\end{itemize}
+
+\subsection{Final Embedded Behavior}
+The final model is not just a static display. It is a persistent embedded companion with time continuity, emotional-state continuity, activity-based adaptation, reward mechanics, and long-lived save state.
+
+\section{Measured Technical Results}
+\subsection{Final Size-Oriented Firmware}
+The final \texttt{-Os} linked image uses \texttt{.text = 57868} bytes, \texttt{.data = 668} bytes, and \texttt{.bss = 3280} bytes.
+
+\subsection{Linked Memory Boundaries}
+The memory boundaries obtained from the actual map are listed in Table~\ref{tab:memory-map}.
+
+\begin{table}[!t]
+\caption{Linked Memory Boundaries}
+\label{tab:memory-map}
+\centering
+\scriptsize
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Symbol} & \textbf{Value} \\
+\hline
+\texttt{\_\_text\_start\_\_} & \texttt{0x00002000} \\
+\hline
+\texttt{\_\_etext} & \texttt{0x0001020c} \\
+\hline
+\texttt{\_\_data\_start\_\_} & \texttt{0x20000000} \\
+\hline
+\texttt{\_\_data\_end\_\_} & \texttt{0x2000029c} \\
+\hline
+\texttt{\_\_bss\_start\_\_} & \texttt{0x200002a0} \\
+\hline
+\texttt{\_\_bss\_end\_\_} & \texttt{0x20000f70} \\
+\hline
+\texttt{\_\_StackTop} & \texttt{0x20008000} \\
+\hline
+\end{tabular}
+\normalsize
+\end{table}
+
+\subsection{Remaining RAM After Static Allocation}
+The remaining RAM calculation is:
+\[
+0x20008000 - 0x20000f70 = 0x7090 = 28816 \text{ bytes}
+\]
+This indicates that the firmware fits comfortably within the RAM budget for the target board.
+
+\subsection{Code-Generation Observations}
+The disassembly confirms efficient interrupt-state handling, compact branch-based control flow, helper-call-based integer division, and strong code-size improvements under optimization.
+
+\section{Limitations}
+Like any practical embedded prototype, the project has limitations.
+
+\subsection{Sensor Fidelity}
+The vibration sensor is simpler than a full IMU or step-detection sensor. It detects motion-related events, but it does not provide medically precise step counting.
+
+\subsection{Behavioral Granularity}
+The emotional model is intentionally simple. It captures motivation-oriented transitions rather than rich emotional complexity.
+
+\subsection{No Wireless Connectivity}
+The current implementation does not sync to a phone or cloud service.
+
+\subsection{Limited Automated Testing}
+The repository does not yet include a formal host-side test harness or peripheral mocks.
+
+\subsection{Display Complexity}
+The OLED is low resolution and still driven as a single-bit framebuffer, so expression is intentionally minimalistic. However, the actual display module is dual-color, with a yellow upper band and a blue main area, which helps separate the status region from the rest of the pet display.
+
+\section{Future Scope}
+The project has strong potential for extension.
+
+\subsection{Improved Activity Sensing}
+\begin{itemize}
+\item replace vibration-only input with an accelerometer or IMU;
+\item support better step estimation; and
+\item distinguish walking, running, and idle motion.
+\end{itemize}
+
+\subsection{Richer Emotional Model}
+\begin{itemize}
+\item more pet moods;
+\item more nuanced behavior transitions; and
+\item more contextual messaging.
+\end{itemize}
+
+\subsection{Better Personalization}
+\begin{itemize}
+\item longer trend windows;
+\item adaptive schedules; and
+\item user-specific reward pacing.
+\end{itemize}
+
+\subsection{Connectivity}
+\begin{itemize}
+\item Bluetooth synchronization;
+\item phone companion application; and
+\item cloud backup of pet state.
+\end{itemize}
+
+\subsection{Expanded Game Mechanics}
+\begin{itemize}
+\item more item types;
+\item multiple pets;
+\item leveling and milestones; and
+\item achievements.
+\end{itemize}
+
+\subsection{Better Testability}
+\begin{itemize}
+\item unit tests for time conversion and save serialization;
+\item mocked I\textsuperscript{2}C tests; and
+\item deterministic replay for sensor traces.
+\end{itemize}
+
+\subsection{Packaging and Productization}
+\begin{itemize}
+\item battery-backed portable enclosure;
+\item wearability improvements; and
+\item more polished industrial design.
+\end{itemize}
+
+\section{Conclusion}
+\texttt{HealthPet} demonstrates that a compact SAMD21 microcontroller can host a complete emotionally expressive fitness companion with persistent state, personalized target logic, and hardware-integrated interaction.
+
+The project is technically meaningful because it combines:
+\begin{itemize}
+\item embedded peripheral integration;
+\item real-time interrupt handling;
+\item EEPROM persistence;
+\item RTC-backed continuity;
+\item animation-based UI;
+\item sound feedback;
+\item memory-conscious architecture; and
+\item measurable optimization analysis.
+\end{itemize}
+
+It is also conceptually meaningful because it translates physical activity into the wellbeing of a virtual companion, creating a feedback loop that is more personal and engaging than a simple counter.
+
+From a systems perspective, the project successfully integrates sensing, timing, user input, storage, rendering, audio, and optimization within the flash and RAM limits of the XIAO SAMD21.
+
+Therefore, \texttt{HealthPet} is both a technically complete embedded implementation and a strong foundation for future work in motivational embedded interaction systems.
+
+\section*{References}
+\begin{thebibliography}{99}
+
+\bibitem{review1}
+HealthPet project proposal, ``Review1.pdf,'' local project document in the HealthPet repository.
+
+\bibitem{byrne2012}
+S.~Byrne \textit{et al.}, ``Caring for mobile phone-based virtual pets can influence youth eating behaviors,'' \textit{Journal of Children and Media}, vol.~6, no.~1, pp.~83--99, 2012.
+
+\bibitem{martins2023}
+C.~F.~Martins \textit{et al.}, ``Pet's influence on humans' daily physical activity and mental health: A meta-analysis,'' \textit{Frontiers in Public Health}, vol.~11, 2023.
+
+\bibitem{park2025}
+S.-W.~Park \textit{et al.}, ``Effectiveness of a digital game-based physical activity program (AI-FIT) on health-related physical fitness in elementary school children,'' \textit{Healthcare}, vol.~13, no.~11, 2025.
+
+\bibitem{ramsay}
+D.~B.~Ramsay \textit{et al.}, \textit{Virtual Pets and Virtual Selves as Exercise Motivation Tools}, publication details not provided in the source proposal.
+
+\end{thebibliography}
+
+\end{document}

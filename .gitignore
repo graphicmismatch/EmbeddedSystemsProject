@@ -16,3 +16,6 @@ build/
 *.elf
 *.hex
 *.map
+codex.md
+/build-analysis
+/Schematic

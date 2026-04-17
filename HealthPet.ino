@@ -8,11 +8,14 @@
 constexpr uint8_t SCREEN_WIDTH = 128;
 constexpr uint8_t SCREEN_HEIGHT = 64;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
+constexpr uint8_t RTC_CLOCK_ADDRESS = 0x68;
 constexpr uint8_t EEPROM_ADDRESS_MIN = 0x50;
 constexpr uint8_t EEPROM_ADDRESS_MAX = 0x57;
 constexpr uint8_t EEPROM_IO_CHUNK_SIZE = 16;
 constexpr uint8_t EEPROM_WRITE_CYCLE_MS = 10;
 constexpr uint8_t RTC_STORAGE_RETRIES = 3;
+constexpr uint32_t STORAGE_I2C_CLOCK_HZ = 100000UL;
+constexpr uint32_t DISPLAY_I2C_CLOCK_HZ = 400000UL;
 
 constexpr uint8_t PIN_BUZZER = 0;
 constexpr uint8_t PIN_SENSOR = 1;
@@ -36,14 +39,17 @@ constexpr uint16_t HAPPY_ANIMATION_MS = 5000;
 constexpr uint16_t SURPRISE_ANIMATION_MS = 3000;
 constexpr uint16_t STATUS_MESSAGE_MS = 3200;
 constexpr uint16_t SAVE_INDICATOR_MS = 1500;
-constexpr uint16_t DISPLAY_REFRESH_MS = 33;
+constexpr uint16_t DISPLAY_REFRESH_MS = 41;
 constexpr uint16_t MINUTES_PER_DAY = 24U * 60U;
+constexpr uint16_t RTC_BASE_YEAR = 2000;
+constexpr uint32_t INACTIVITY_SLEEP_MS = 2UL * 60UL * 1000UL;
 constexpr uint32_t PET_COOLDOWN_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t SAVE_INTERVAL_MS = 5UL * 1000UL;
 constexpr uint32_t HIGH_EXERCISE_WINDOW_MS = 20UL * 1000UL;
 constexpr uint32_t SOFTWARE_MINUTE_MS = 60UL * 1000UL;
 
 constexpr uint8_t HIGH_EXERCISE_PULSES = 14;
+constexpr uint8_t STEPS_PER_ACTIVITY_POINT = 10;
 constexpr uint16_t MIN_DAILY_BASELINE = 24;
 constexpr uint8_t TARGET_INCREASE_PERCENT = 5;
 constexpr uint8_t TARGET_INCREASE_MIN = 3;
@@ -143,6 +149,7 @@ struct PetState {
   uint32_t surpriseUntilMs;
   uint32_t statusUntilMs;
   uint32_t lastPetMs;
+  uint32_t lastActivityMs;
   uint32_t highExerciseWindowStartMs;
   uint32_t lastRewardActivity;
   uint16_t highExercisePulses;
@@ -244,17 +251,30 @@ uint8_t activeSoundStep = 0;
 uint32_t nextSoundChangeMs = 0;
 
 uint8_t rtcStorageAddress = 0;
+bool rtcClockAvailable = false;
 uint32_t lastClockTickMs = 0;
 uint32_t lastSaveMs = 0;
 uint32_t lastSaveIndicatorUntilMs = 0;
 uint32_t lastSaveFailureUntilMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t softwareMinuteAccumulatorMs = 0;
+uint8_t pendingStepRemainder = 0;
 
 volatile uint32_t pendingSensorTransitions = 0;
 volatile uint32_t pendingSensorActiveEdges = 0;
 volatile bool pendingSensorLevelHigh = false;
 volatile uint32_t lastSensorInterruptUs = 0;
+
+void advanceGameMinutes(uint32_t elapsedMinutes, uint32_t now, bool notify = false);
+void syncRtcClockToGameTime();
+
+inline void useStorageI2cClock() {
+  Wire.setClock(STORAGE_I2C_CLOCK_HZ);
+}
+
+inline void useDisplayI2cClock() {
+  Wire.setClock(DISPLAY_I2C_CLOCK_HZ);
+}
 
 inline uint32_t saveAndDisableInterrupts() {
   uint32_t primask;
@@ -279,6 +299,26 @@ inline void waitForInterrupt() {
   __asm__ volatile("wfi");
 }
 
+uint8_t bcdToDec(uint8_t value) {
+  return static_cast<uint8_t>(((value >> 4) * 10U) + (value & 0x0F));
+}
+
+uint8_t decToBcd(uint8_t value) {
+  return static_cast<uint8_t>(((value / 10U) << 4) | (value % 10U));
+}
+
+bool isLeapYear(uint16_t year) {
+  return (year % 4U) == 0U && (((year % 100U) != 0U) || ((year % 400U) == 0U));
+}
+
+uint8_t daysInMonth(uint16_t year, uint8_t month) {
+  static const uint8_t DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month == 2 && isLeapYear(year)) {
+    return 29;
+  }
+  return DAYS[month - 1];
+}
+
 void onSensorInterrupt() {
   const uint32_t nowUs = micros();
   if ((nowUs - lastSensorInterruptUs) < SENSOR_DEBOUNCE_US) {
@@ -294,8 +334,6 @@ void onSensorInterrupt() {
 
   const bool sensorActive = SENSOR_ACTIVE_LOW ? !sensorLevelHigh : sensorLevelHigh;
   if (sensorActive && !petUnavailable()) {
-    pet.todayActivity++;
-    pet.lifetimeActivity++;
     if (pendingSensorActiveEdges != 0xFFFFFFFFUL) {
       pendingSensorActiveEdges++;
     }
@@ -418,16 +456,167 @@ bool saveDataEquals(const SaveData &a, const SaveData &b) {
 }
 
 bool detectRtcStorageAddress() {
+  useStorageI2cClock();
   for (uint8_t address = EEPROM_ADDRESS_MIN; address <= EEPROM_ADDRESS_MAX; ++address) {
     Wire.beginTransmission(address);
     if (Wire.endTransmission() == 0) {
       rtcStorageAddress = address;
+      useDisplayI2cClock();
       return true;
     }
   }
 
   rtcStorageAddress = 0;
+  useDisplayI2cClock();
   return false;
+}
+
+bool detectRtcClock() {
+  useStorageI2cClock();
+  Wire.beginTransmission(RTC_CLOCK_ADDRESS);
+  const bool detected = Wire.endTransmission() == 0;
+  useDisplayI2cClock();
+  return detected;
+}
+
+bool rtcMinutesFromDateTime(uint16_t year, uint8_t month, uint8_t day,
+                            uint8_t hour, uint8_t minute, uint32_t &totalMinutes) {
+  if (year < RTC_BASE_YEAR || month < 1 || month > 12 || day < 1 ||
+      day > daysInMonth(year, month) || hour > 23 || minute > 59) {
+    return false;
+  }
+
+  uint32_t totalDays = 0;
+  for (uint16_t currentYear = RTC_BASE_YEAR; currentYear < year; ++currentYear) {
+    totalDays += isLeapYear(currentYear) ? 366UL : 365UL;
+  }
+
+  for (uint8_t currentMonth = 1; currentMonth < month; ++currentMonth) {
+    totalDays += daysInMonth(year, currentMonth);
+  }
+
+  totalDays += static_cast<uint32_t>(day - 1U);
+  totalMinutes = totalDays * MINUTES_PER_DAY +
+                 static_cast<uint32_t>(hour) * 60UL +
+                 static_cast<uint32_t>(minute);
+  return true;
+}
+
+void rtcDateTimeFromMinutes(uint32_t totalMinutes, uint16_t &year, uint8_t &month,
+                            uint8_t &day, uint8_t &hour, uint8_t &minute,
+                            uint8_t &dayOfWeek) {
+  uint32_t totalDays = totalMinutes / MINUTES_PER_DAY;
+  const uint16_t minuteOfDay = static_cast<uint16_t>(totalMinutes % MINUTES_PER_DAY);
+
+  year = RTC_BASE_YEAR;
+  while (true) {
+    const uint16_t daysThisYear = isLeapYear(year) ? 366U : 365U;
+    if (totalDays < daysThisYear) {
+      break;
+    }
+    totalDays -= daysThisYear;
+    ++year;
+  }
+
+  month = 1;
+  while (true) {
+    const uint8_t daysThisMonth = daysInMonth(year, month);
+    if (totalDays < daysThisMonth) {
+      break;
+    }
+    totalDays -= daysThisMonth;
+    ++month;
+  }
+
+  day = static_cast<uint8_t>(totalDays + 1U);
+  hour = static_cast<uint8_t>(minuteOfDay / 60U);
+  minute = static_cast<uint8_t>(minuteOfDay % 60U);
+
+  // 2000-01-01 was a Saturday. DS1307 day-of-week is user-defined 1..7.
+  dayOfWeek = static_cast<uint8_t>(((totalMinutes / MINUTES_PER_DAY) + 5UL) % 7UL) + 1U;
+}
+
+uint32_t gameTotalMinutes() {
+  return static_cast<uint32_t>(currentDayCount) * MINUTES_PER_DAY + currentMinuteOfDay;
+}
+
+bool readRtcClockMinutes(uint32_t &totalMinutes) {
+  if (!rtcClockAvailable) {
+    return false;
+  }
+
+  useStorageI2cClock();
+  Wire.beginTransmission(RTC_CLOCK_ADDRESS);
+  Wire.write(static_cast<uint8_t>(0x00));
+  if (Wire.endTransmission() != 0) {
+    useDisplayI2cClock();
+    return false;
+  }
+
+  if (Wire.requestFrom(RTC_CLOCK_ADDRESS, static_cast<uint8_t>(7)) != 7) {
+    useDisplayI2cClock();
+    return false;
+  }
+
+  const uint8_t secondsRaw = Wire.read();
+  const uint8_t minutesRaw = Wire.read();
+  const uint8_t hoursRaw = Wire.read();
+  Wire.read(); // day-of-week
+  const uint8_t dayRaw = Wire.read();
+  const uint8_t monthRaw = Wire.read();
+  const uint8_t yearRaw = Wire.read();
+  useDisplayI2cClock();
+
+  if ((secondsRaw & 0x80U) != 0U) {
+    return false;
+  }
+
+  const uint8_t minute = bcdToDec(minutesRaw & 0x7FU);
+  uint8_t hour = 0;
+  if ((hoursRaw & 0x40U) != 0U) {
+    hour = bcdToDec(hoursRaw & 0x1FU);
+    const bool isPm = (hoursRaw & 0x20U) != 0U;
+    if (hour == 12U) {
+      hour = isPm ? 12U : 0U;
+    } else if (isPm) {
+      hour = static_cast<uint8_t>(hour + 12U);
+    }
+  } else {
+    hour = bcdToDec(hoursRaw & 0x3FU);
+  }
+
+  const uint8_t day = bcdToDec(dayRaw & 0x3FU);
+  const uint8_t month = bcdToDec(monthRaw & 0x1FU);
+  const uint16_t year = static_cast<uint16_t>(RTC_BASE_YEAR + bcdToDec(yearRaw));
+  return rtcMinutesFromDateTime(year, month, day, hour, minute, totalMinutes);
+}
+
+bool writeRtcClockMinutes(uint32_t totalMinutes) {
+  if (!rtcClockAvailable) {
+    return false;
+  }
+
+  uint16_t year = RTC_BASE_YEAR;
+  uint8_t month = 1;
+  uint8_t day = 1;
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+  uint8_t dayOfWeek = 1;
+  rtcDateTimeFromMinutes(totalMinutes, year, month, day, hour, minute, dayOfWeek);
+
+  useStorageI2cClock();
+  Wire.beginTransmission(RTC_CLOCK_ADDRESS);
+  Wire.write(static_cast<uint8_t>(0x00));
+  Wire.write(decToBcd(0)); // seconds
+  Wire.write(decToBcd(minute));
+  Wire.write(decToBcd(hour));
+  Wire.write(decToBcd(dayOfWeek));
+  Wire.write(decToBcd(day));
+  Wire.write(decToBcd(month));
+  Wire.write(decToBcd(static_cast<uint8_t>(year - RTC_BASE_YEAR)));
+  const bool success = Wire.endTransmission() == 0;
+  useDisplayI2cClock();
+  return success;
 }
 
 bool rtcReadBlock(uint16_t startAddress, uint8_t *buffer, uint8_t length) {
@@ -435,6 +624,7 @@ bool rtcReadBlock(uint16_t startAddress, uint8_t *buffer, uint8_t length) {
     return false;
   }
 
+  useStorageI2cClock();
   uint8_t offset = 0;
   while (offset < length) {
     uint8_t chunkLength = static_cast<uint8_t>(length - offset);
@@ -447,10 +637,12 @@ bool rtcReadBlock(uint16_t startAddress, uint8_t *buffer, uint8_t length) {
     Wire.write(static_cast<uint8_t>((address >> 8) & 0xFF));
     Wire.write(static_cast<uint8_t>(address & 0xFF));
     if (Wire.endTransmission() != 0) {
+      useDisplayI2cClock();
       return false;
     }
 
     if (Wire.requestFrom(rtcStorageAddress, chunkLength) != chunkLength) {
+      useDisplayI2cClock();
       return false;
     }
 
@@ -459,6 +651,7 @@ bool rtcReadBlock(uint16_t startAddress, uint8_t *buffer, uint8_t length) {
     }
     offset += chunkLength;
   }
+  useDisplayI2cClock();
   return true;
 }
 
@@ -467,6 +660,7 @@ bool rtcWriteBlock(uint16_t startAddress, const uint8_t *buffer, uint8_t length)
     return false;
   }
 
+  useStorageI2cClock();
   uint8_t offset = 0;
   while (offset < length) {
     uint8_t chunkLength = static_cast<uint8_t>(length - offset);
@@ -482,12 +676,14 @@ bool rtcWriteBlock(uint16_t startAddress, const uint8_t *buffer, uint8_t length)
       Wire.write(buffer[offset + i]);
     }
     if (Wire.endTransmission() != 0) {
+      useDisplayI2cClock();
       return false;
     }
 
     delay(EEPROM_WRITE_CYCLE_MS);
     offset += chunkLength;
   }
+  useDisplayI2cClock();
   return true;
 }
 
@@ -623,6 +819,10 @@ bool isSleepingNow() {
   return currentHour >= SLEEP_START_HOUR || currentHour < SLEEP_END_HOUR;
 }
 
+bool isIdleSleeping(uint32_t now) {
+  return (now - pet.lastActivityMs) >= INACTIVITY_SLEEP_MS;
+}
+
 uint32_t rollingAverage() {
   if (pet.historyCount == 0) {
     return MIN_DAILY_BASELINE;
@@ -658,6 +858,23 @@ uint8_t todayProgressPercent() {
   return static_cast<uint8_t>(percent > 100 ? 100 : percent);
 }
 
+uint16_t awakeMinutesElapsed(uint16_t minuteOfDay) {
+  const uint16_t wakeStartMinute = static_cast<uint16_t>(SLEEP_END_HOUR) * 60U;
+  const uint16_t sleepStartMinute = static_cast<uint16_t>(SLEEP_START_HOUR) * 60U;
+
+  if (minuteOfDay <= wakeStartMinute) {
+    return 0;
+  }
+  if (minuteOfDay >= sleepStartMinute) {
+    return sleepStartMinute - wakeStartMinute;
+  }
+  return minuteOfDay - wakeStartMinute;
+}
+
+uint16_t totalAwakeMinutes() {
+  return static_cast<uint16_t>(SLEEP_START_HOUR - SLEEP_END_HOUR) * 60U;
+}
+
 void markDirty() {
   pet.dirty = true;
 }
@@ -680,21 +897,26 @@ void setDefaultState() {
   pet.surpriseUntilMs = 0;
   pet.statusUntilMs = 0;
   pet.lastPetMs = 0;
+  pet.lastActivityMs = 0;
   pet.highExerciseWindowStartMs = 0;
   pet.lastRewardActivity = 0;
   pet.highExercisePulses = 0;
   pet.dirty = false;
   pet.statusMessage[0] = '\0';
+  pendingStepRemainder = 0;
 }
 
 bool isValidSaveData(const SaveData &saved) {
   return validateSaveDataReason(saved) == nullptr;
 }
 
-void loadState() {
+void loadState(uint32_t now) {
   setDefaultState();
 
   SaveData saved = {};
+  bool loadedSave = false;
+  bool rtcSeededFromSave = false;
+  bool rtcInitializedOnBoot = false;
   if (readSaveDataWithRetry(saved)) {
     if (isValidSaveData(saved)) {
       pet.health = saved.health;
@@ -710,6 +932,7 @@ void loadState() {
       currentDayCount = saved.dayCount;
       currentMinuteOfDay = saved.minuteOfDay;
       pet.lastProcessedDay = saved.dayCount;
+      loadedSave = true;
     } else {
       if (Serial) {
         Serial.print("EEPROM save ignored: ");
@@ -719,6 +942,54 @@ void loadState() {
   } else if (Serial) {
     Serial.println("No valid EEPROM save found");
   }
+
+  const uint32_t savedTotalMinutes = gameTotalMinutes();
+  if (rtcClockAvailable) {
+    uint32_t rtcMinutes = 0;
+    const bool rtcTimeValid = readRtcClockMinutes(rtcMinutes);
+    if (loadedSave && rtcTimeValid) {
+      if (rtcMinutes >= savedTotalMinutes) {
+        advanceGameMinutes(rtcMinutes - savedTotalMinutes, now, false);
+      } else if (writeRtcClockMinutes(savedTotalMinutes)) {
+        rtcSeededFromSave = true;
+        rtcInitializedOnBoot = true;
+      } else {
+        rtcClockAvailable = false;
+      }
+    } else if (writeRtcClockMinutes(savedTotalMinutes)) {
+      rtcSeededFromSave = loadedSave;
+      rtcInitializedOnBoot = true;
+    } else {
+      rtcClockAvailable = false;
+    }
+  }
+
+  if (petDead()) {
+    setStatus("Your pet died", now, 6000);
+  } else if (petLeft()) {
+    setStatus("Your pet left", now, 6000);
+  } else if (loadedSave && rtcSeededFromSave) {
+    setStatus("RTC reset, using save", now, 2000);
+  } else if (rtcInitializedOnBoot) {
+    setStatus("RTC initialized", now, 2000);
+  } else if (!rtcClockAvailable) {
+    setStatus("RTC unavailable", now, 2000);
+  }
+}
+
+void restartPet(uint32_t now) {
+  currentDayCount = 0;
+  currentMinuteOfDay = 12U * 60U;
+  softwareMinuteAccumulatorMs = 0;
+  setDefaultState();
+  pet.lastActivityMs = now;
+  pet.highExerciseWindowStartMs = now;
+  pet.screen = SCREEN_HOME;
+  markDirty();
+  setStatus("New pet arrived", now, 2000);
+  triggerHappy(now);
+  playSound(SOUND_HAPPY);
+  syncRtcClockToGameTime();
 }
 
 void saveState(bool force) {
@@ -780,32 +1051,9 @@ void triggerSurprise(uint32_t now) {
   pet.surpriseUntilMs = now + SURPRISE_ANIMATION_MS;
 }
 
-void finalizeDay(uint32_t dayActivity, uint32_t now) {
+void completeDay(uint32_t dayActivity, uint32_t now, bool notify = true) {
   const uint32_t target = activityTarget();
   const uint32_t percent = target == 0 ? 0 : (dayActivity * 100UL) / target;
-
-  int healthDelta = -6;
-  int affectionDelta = -2;
-
-  if (percent >= 115) {
-    healthDelta = 8;
-    affectionDelta = 1;
-  } else if (percent >= 100) {
-    healthDelta = 5;
-    affectionDelta = 0;
-  } else if (percent >= 85) {
-    healthDelta = -2;
-    affectionDelta = -1;
-  } else if (percent >= 70) {
-    healthDelta = -8;
-    affectionDelta = -3;
-  } else {
-    healthDelta = -15;
-    affectionDelta = -5;
-  }
-
-  pet.health = clampStat(static_cast<int>(pet.health) + healthDelta);
-  pet.affection = clampStat(static_cast<int>(pet.affection) + affectionDelta);
   pushCompletedDay(dayActivity);
   pet.todayActivity = 0;
   pet.lastRewardActivity = 0;
@@ -813,15 +1061,7 @@ void finalizeDay(uint32_t dayActivity, uint32_t now) {
   pet.highExerciseWindowStartMs = now;
   markDirty();
 
-  if (petDead()) {
-    setStatus("Your pet died", now, 6000);
-    playSound(SOUND_DEATH);
-    return;
-  }
-
-  if (petLeft()) {
-    setStatus("Your pet left", now, 6000);
-    playSound(SOUND_LEAVE);
+  if (!notify) {
     return;
   }
 
@@ -835,10 +1075,91 @@ void finalizeDay(uint32_t dayActivity, uint32_t now) {
   }
 }
 
-void processDayRollovers(uint32_t now) {
-  while (pet.lastProcessedDay < currentDayCount) {
-    finalizeDay(pet.todayActivity, now);
-    pet.lastProcessedDay++;
+void applyActivityPaceDrain(uint32_t now, bool notify = true) {
+  if (petUnavailable()) {
+    return;
+  }
+  if (isSleepingNow()) {
+    return;
+  }
+
+  const uint32_t target = activityTarget();
+  const uint16_t awakeElapsed = awakeMinutesElapsed(currentMinuteOfDay);
+  const uint16_t awakeTotal = totalAwakeMinutes();
+  if (target == 0 || awakeElapsed == 0 || awakeTotal == 0) {
+    return;
+  }
+
+  const uint32_t expectedActivity =
+      ((target * awakeElapsed) + awakeTotal - 1U) / awakeTotal;
+  if (expectedActivity == 0) {
+    return;
+  }
+
+  const uint32_t pacePercent = (pet.todayActivity * 100UL) / expectedActivity;
+  int healthDelta = 0;
+  int affectionDelta = 0;
+
+  if (pacePercent >= 100UL) {
+    return;
+  } else if (pacePercent >= 75UL) {
+    affectionDelta = -1;
+  } else if (pacePercent >= 50UL) {
+    healthDelta = -1;
+    affectionDelta = -1;
+  } else {
+    healthDelta = -1;
+    affectionDelta = -2;
+  }
+
+  pet.health = clampStat(static_cast<int>(pet.health) + healthDelta);
+  pet.affection = clampStat(static_cast<int>(pet.affection) + affectionDelta);
+  markDirty();
+
+  if (!notify) {
+    return;
+  }
+
+  if (petDead()) {
+    setStatus("Your pet died", now, 6000);
+    playSound(SOUND_DEATH);
+    return;
+  }
+
+  if (petLeft()) {
+    setStatus("Your pet left", now, 6000);
+    playSound(SOUND_LEAVE);
+  }
+}
+
+void syncRtcClockToGameTime() {
+  if (!rtcClockAvailable) {
+    return;
+  }
+
+  if (!writeRtcClockMinutes(gameTotalMinutes())) {
+    rtcClockAvailable = false;
+  }
+}
+
+void advanceGameMinute(uint32_t now, bool notify = true) {
+  currentMinuteOfDay++;
+  if (currentMinuteOfDay >= MINUTES_PER_DAY) {
+    completeDay(pet.todayActivity, now, notify);
+    currentMinuteOfDay = 0;
+    currentDayCount++;
+    markDirty();
+  }
+
+  if ((currentMinuteOfDay % 60U) == 0) {
+    applyActivityPaceDrain(now, notify);
+  }
+}
+
+void advanceGameMinutes(uint32_t elapsedMinutes, uint32_t now, bool notify) {
+  while (elapsedMinutes > 0) {
+    advanceGameMinute(now, notify);
+    --elapsedMinutes;
   }
 }
 
@@ -849,12 +1170,8 @@ void updateClock(uint32_t now) {
   softwareMinuteAccumulatorMs += elapsed;
   while (softwareMinuteAccumulatorMs >= SOFTWARE_MINUTE_MS) {
     softwareMinuteAccumulatorMs -= SOFTWARE_MINUTE_MS;
-    currentMinuteOfDay++;
-    if (currentMinuteOfDay >= MINUTES_PER_DAY) {
-      currentMinuteOfDay = 0;
-      currentDayCount++;
-      markDirty();
-    }
+    advanceGameMinute(now);
+    syncRtcClockToGameTime();
   }
 }
 
@@ -917,23 +1234,34 @@ void onActivityPulse(uint32_t now, uint32_t pulseCount) {
     return;
   }
 
-  markDirty();
+  pet.lastActivityMs = now;
+  const uint32_t totalPendingSteps =
+      static_cast<uint32_t>(pendingStepRemainder) + pulseCount;
+  const uint32_t activityGain = totalPendingSteps / STEPS_PER_ACTIVITY_POINT;
+  pendingStepRemainder =
+      static_cast<uint8_t>(totalPendingSteps % STEPS_PER_ACTIVITY_POINT);
 
   if ((now - pet.highExerciseWindowStartMs) > HIGH_EXERCISE_WINDOW_MS) {
     pet.highExerciseWindowStartMs = now;
     pet.highExercisePulses = 0;
   }
 
-  const uint32_t startingTodayActivity =
-      pet.todayActivity >= pulseCount ? pet.todayActivity - pulseCount : 0;
-  for (uint32_t pulse = 0; pulse < pulseCount; pulse++) {
-    const uint32_t activityTotal = startingTodayActivity + pulse + 1;
+  const uint32_t startingTodayActivity = pet.todayActivity;
+  if (activityGain > 0) {
+    pet.todayActivity += activityGain;
+    pet.lifetimeActivity += activityGain;
+    markDirty();
+  }
 
-    pet.highExercisePulses++;
+  for (uint32_t point = 0; point < activityGain; ++point) {
+    const uint32_t activityTotal = startingTodayActivity + point + 1;
     if ((activityTotal % 12UL) == 0) {
       triggerHappy(now);
     }
+  }
 
+  for (uint32_t pulse = 0; pulse < pulseCount; pulse++) {
+    pet.highExercisePulses++;
     if (pet.highExercisePulses >= HIGH_EXERCISE_PULSES) {
       pet.highExercisePulses = 0;
       pet.highExerciseWindowStartMs = now;
@@ -976,6 +1304,7 @@ void cycleScreen(int8_t direction, uint32_t now) {
 
 void petThePet(uint32_t now) {
   if (petUnavailable()) {
+    restartPet(now);
     return;
   }
 
@@ -1074,7 +1403,7 @@ const AnimationClip &activeClip(uint32_t now) {
   if (now < pet.happyUntilMs) {
     return tier.happy;
   }
-  if (isSleepingNow()) {
+  if (isIdleSleeping(now)) {
     return tier.sleep;
   }
   return tier.awake;
@@ -1148,26 +1477,26 @@ void drawHomeScreen(uint32_t now) {
 
 void drawStatsScreen() {
   drawTopBar();
-  display.setCursor(0, 14);
+  display.setCursor(0, 16);
   display.print("Today: ");
   display.print(pet.todayActivity);
 
-  display.setCursor(0, 25);
+  display.setCursor(0, 27);
   display.print("Target: ");
   display.print(activityTarget());
 
-  display.setCursor(0, 36);
+  display.setCursor(0, 38);
   display.print("3d avg: ");
   display.print(rollingAverage());
 
-  display.setCursor(0, 47);
+  display.setCursor(0, 49);
   display.print("Age: ");
   printAge();
 }
 
 void drawInventoryScreen() {
   drawTopBar();
-  display.setCursor(0, 14);
+  display.setCursor(0, 16);
   display.print("Items");
 
   display.setCursor(0, 28);
@@ -1196,6 +1525,7 @@ void drawUi(uint32_t now) {
   }
 
   drawSaveIndicator(now);
+  useDisplayI2cClock();
   display.display();
 }
 
@@ -1214,6 +1544,7 @@ void setup() {
 
   randomSeed(micros());
   Wire.begin();
+  useDisplayI2cClock();
   pendingSensorLevelHigh = digitalRead(PIN_SENSOR) == HIGH;
   attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), onSensorInterrupt, CHANGE);
 
@@ -1222,25 +1553,30 @@ void setup() {
   display.display();
 
   const bool eepromDetected = detectRtcStorageAddress();
+  rtcClockAvailable = detectRtcClock();
   if (Serial) {
     if (!eepromDetected) {
       Serial.println("TinyRTC EEPROM not detected");
+    }
+    if (!rtcClockAvailable) {
+      Serial.println("RTC clock not detected");
     }
   }
 
   lastClockTickMs = millis();
   lastDrawMs = lastClockTickMs;
-  loadState();
-  processDayRollovers(lastClockTickMs);
+  loadState(lastClockTickMs);
+  pet.lastActivityMs = lastClockTickMs;
 
-  setStatus("HealthPet ready", millis(), 2000);
+  if (pet.statusMessage[0] == '\0') {
+    setStatus("HealthPet ready", millis(), 2000);
+  }
 }
 
 void loop() {
   const uint32_t now = millis();
 
   updateClock(now);
-  processDayRollovers(now);
   updateButton(prevButton, now);
   updateButton(actionButton, now);
   updateButton(nextButton, now);

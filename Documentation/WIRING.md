@@ -51,8 +51,8 @@ The firmware is structured to fit the XIAO SAMD21 comfortably by keeping sprite 
 ## Build Notes
 
 - The OLED is assumed to be the existing `128x64` SSD1306 module at I2C address `0x3C`, matching the original sketch.
-- The RTC is assumed to be a `DS1307` module at I2C address `0x68`.
-- Game saves are stored in the DS1307's `56-byte` battery-backed RAM, so the module needs its backup battery to retain progress while power is off.
-- If the RTC clock is not connected or not initialized, the firmware falls back to a software clock and shows a status warning. Save/load still works as long as the DS1307 responds on I2C.
+- The RTC clock is assumed to be a `DS1307`-compatible device at I2C address `0x68`. A `DS3231` module that exposes the same register map for timekeeping will also work for this firmware path.
+- Game saves are stored in the TinyRTC module's EEPROM at I2C addresses `0x50`-`0x57` rather than in the RTC clock registers, so save/load can still work even if the RTC clock has been reset.
+- On boot, the firmware compares the saved in-game time with the RTC clock. If the RTC advanced while power was off, the pet catches up by that elapsed time. If the RTC clock is missing or reset, the firmware falls back to the saved in-game time, reseeds the RTC when possible, and shows a status warning.
 - Adjust the SW-420 module potentiometer so ordinary desk vibration does not spam the activity count.
 - If you are using a bare R-0784 sensor instead of a module, wire it between `D1` and `GND`; the internal pull-up in firmware keeps the input stable.

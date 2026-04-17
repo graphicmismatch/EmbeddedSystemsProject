@@ -4,7 +4,7 @@
 
 - Board target: Seeed Studio XIAO SAMD21.
 - OLED: 128x64 SSD1306 over I2C at `0x3C` as defined in the existing sketch.
-- RTC module assumption: DS3231 on the same I2C bus as the OLED.
+- RTC module assumption: DS1307-compatible clock at `0x68` plus TinyRTC EEPROM at `0x50`-`0x57` on the same I2C bus as the OLED.
 - Vibration sensor assumption: SW-420 module used as a digital activity pulse source.
 - Buzzer assumption: passive piezo buzzer so short melodies can be generated with `tone()`.
 
@@ -18,10 +18,11 @@
 - Added placeholder sprite symbols in `Images.h` that match the required asset naming convention.
 - Added `WIRING.md` with a full pin map and text wiring diagram.
 - Updated `img2bitmap.py` so transparent PNG sprites convert cleanly into the bitmap format used by the sketch.
-- Added `SPRITES.md` listing the required sprite files for all health tiers and pet states.
+- Added `SPRITES.md` listing the required sprite files for all health tiers and pet states, with the sprite size now documented as `16x16` to match the code.
 
 ## Remaining
 
 - Replace the placeholder bitmaps in `Images.h` with real converted sprite assets once art is ready.
+- Keep replacement sprite art at `16x16` unless the `Bitmap` declarations and layout code are intentionally changed.
 - Verify the firmware against the exact Arduino board package and installed libraries on the target machine.
 - Tune sensor threshold and activity balancing using real hardware movement data.
