@@ -49,7 +49,8 @@ constexpr uint32_t HIGH_EXERCISE_WINDOW_MS = 20UL * 1000UL;
 constexpr uint32_t SOFTWARE_MINUTE_MS = 60UL * 1000UL;
 
 constexpr uint8_t HIGH_EXERCISE_PULSES = 14;
-constexpr uint8_t STEPS_PER_ACTIVITY_POINT = 10;
+constexpr uint8_t STEPS_PER_ACTIVITY_POINT = 8;
+constexpr uint8_t REWARD_DROP_CHANCE_PERCENT = 55;
 constexpr uint16_t MIN_DAILY_BASELINE = 24;
 constexpr uint8_t TARGET_INCREASE_PERCENT = 5;
 constexpr uint8_t TARGET_INCREASE_MIN = 3;
@@ -1101,15 +1102,17 @@ void applyActivityPaceDrain(uint32_t now, bool notify = true) {
   int affectionDelta = 0;
 
   if (pacePercent >= 100UL) {
-    return;
+    affectionDelta = -1;
+    healthDelta = -1;
   } else if (pacePercent >= 75UL) {
     affectionDelta = -1;
+    healthDelta = -2;
   } else if (pacePercent >= 50UL) {
-    healthDelta = -1;
+    healthDelta = -3;
     affectionDelta = -1;
   } else {
-    healthDelta = -1;
-    affectionDelta = -2;
+    healthDelta = -4;
+    affectionDelta = -3;
   }
 
   pet.health = clampStat(static_cast<int>(pet.health) + healthDelta);
@@ -1151,7 +1154,7 @@ void advanceGameMinute(uint32_t now, bool notify = true) {
     markDirty();
   }
 
-  if ((currentMinuteOfDay % 60U) == 0) {
+  if ((currentMinuteOfDay % 30U) == 0) {
     applyActivityPaceDrain(now, notify);
   }
 }
@@ -1222,7 +1225,7 @@ void maybeDropReward(uint32_t now) {
   }
 
   pet.lastRewardActivity = pet.todayActivity;
-  if (random(100) < 35) {
+  if (random(100) < REWARD_DROP_CHANCE_PERCENT) {
     addReward(random(100) < 30, now);
   } else {
     triggerSurprise(now);
